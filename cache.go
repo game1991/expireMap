@@ -1,42 +1,59 @@
 package expiremap
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
-
-// Cacher ...
-type Cacher interface {
-	Set(key string, value interface{}, timestamp time.Duration) error
-	Get(key string, timestamp time.Duration) (interface{}, error)
-	Delete(key string) error
-	TTL(key string) int64
-	Size() int
-}
-
-var cacheInstance Cacher
 
 const (
 	// DEFAULTEXPIRED 默认过期时间
 	DEFAULTEXPIRED = 24 * time.Hour
 	maxDeletion    = 1 << 20
 	copyThreshold  = 1 << 10 // 复制old临界点
+	// MaxKeyLenth 默认key长度
+	MaxKeyLenth = 1024
 )
 
-type cache struct {
+// Cache 缓存对象
+type Cache struct {
+	MaxEntries int //最大缓存项
+	bucket     *Container
+	pool       *sync.Pool // 对象池
+	mutex      *sync.RWMutex
+}
+
+// Container 缓存容器
+type Container struct {
 	deleteOld int
 	deleteNew int
-	old       map[string]*val
-	new       map[string]*val
-	mutex     *sync.RWMutex
+	oldbucket map[string]*list.Element
+	newbucket map[string]*list.Element
+	lruList   *list.List // 节点链表结果
 }
 
-type val struct {
-	data       interface{}
-	expiration int64 //(时间戳精度到秒)
+// CacheEntry 一个单独的缓存对象
+type CacheEntry struct {
+	Key        string
+	Value      interface{}
+	Expiration int64 //(时间戳精度到秒)
 }
 
-func (c *cache) Set(key string, value interface{}, timestamp time.Duration) error {
+func (c *Cache) checkInit() error {
+	if c.bucket == nil || c.mutex == nil || c.pool == nil {
+		return ErrNotInit
+	}
+	return nil
+}
+
+func (c *Cache) Set(key string, value interface{}, timestamp time.Duration) error {
+	if err := c.checkInit(); err != nil {
+		return err
+	}
+
+	if len(key) > MaxKeyLenth {
+		return ErrTooLoogKey
+	}
 	// 如果传入了过期时间使用过期时间，如果没有传入，则使用默认过期时间
 	if timestamp <= 0 {
 		timestamp = DEFAULTEXPIRED
@@ -61,14 +78,10 @@ func (c *cache) Set(key string, value interface{}, timestamp time.Duration) erro
 	}
 	c.mutex.Unlock()
 
-	time.AfterFunc(timestamp, func() {
-		c.Delete(key)
-	})
-
 	return nil
 }
 
-func (c *cache) Get(key string, timestamp time.Duration) (interface{}, error) {
+func (c *Cache) Get(key string, timestamp time.Duration) (interface{}, error) {
 	var val *val
 	var found bool
 	c.mutex.RLock()
@@ -97,7 +110,16 @@ func (c *cache) Get(key string, timestamp time.Duration) (interface{}, error) {
 	return val.data, nil
 }
 
-func (c *cache) Delete(key string) error {
+func (c *Cache) get(key string) bool {
+
+}
+
+//
+func (c *Cache) isExpired(key string) bool {
+
+}
+
+func (c *Cache) Delete(key string) error {
 	c.mutex.Lock()
 	if _, ok := c.old[key]; ok {
 		delete(c.old, key)
@@ -129,6 +151,10 @@ func (c *cache) Delete(key string) error {
 	return nil
 }
 
+func (c *cache) delete(key string) error {
+
+}
+
 func (c *cache) TTL(key string) int64 {
 	var found bool
 	var val *val
@@ -142,32 +168,40 @@ func (c *cache) TTL(key string) int64 {
 	if found {
 		// 单位为秒
 		ttl := val.expiration - time.Now().Unix()
-		if ttl > 0 {
-			return ttl
+		if ttl < 0 {
+			// 处理过期的key
+			c.Delete(key)
+			return 0
 		}
+		return ttl
 	}
 	return 0
 }
 
-func (c *cache) Size() int {
+func (c *Cache) Size() int {
 	c.mutex.RLock()
 	size := len(c.old) + len(c.new)
 	c.mutex.RUnlock()
 	return size
 }
 
-func newCache() *cache {
-	return &cache{
-		old:   make(map[string]*val),
-		new:   make(map[string]*val),
+// NewCache 获取一个内存缓存对象并设置默认参数
+//默认每个储存容器初始化大小为5W
+//@maxEntries 缓存项储存最大值，超过该值会被移除缓存
+//@capacity 初始缓存容量
+func NewCache(maxEntries int, capacity int) *Cache {
+	return &Cache{
+		MaxEntries: maxEntries,
+		bucket: &Container{
+			oldbucket: make(map[string]*list.Element, capacity),
+			newbucket: make(map[string]*list.Element, capacity),
+			lruList:   list.New(),
+		},
+		pool: &sync.Pool{
+			New: func() interface{} {
+				return &CacheEntry{}
+			},
+		},
 		mutex: new(sync.RWMutex),
 	}
-}
-
-// GetCacher 获取接口实例
-func GetCacher() Cacher {
-	if cacheInstance == nil {
-		cacheInstance = newCache()
-	}
-	return cacheInstance
 }
